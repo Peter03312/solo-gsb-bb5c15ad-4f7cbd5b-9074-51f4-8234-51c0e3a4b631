@@ -66,6 +66,10 @@
                 <i class="ot-cg-swatch"></i>整架重心
                 <i class="ot-proj-swatch stable"></i>投影（稳定/临界/倾覆）
               </span>
+              <span id="wheelLegend" class="wheel-legend">
+                <i class="wh-rect-swatch"></i>轮组矩形
+                <i class="wh-wheel-swatch ok"></i>车轮（反力/超载/负反力）
+              </span>
             </div>
           </div>
           <canvas id="topView"></canvas>
@@ -227,6 +231,55 @@
         </div>
         <div id="doorList"></div>
         <div id="doorOutput"></div>
+      </div>
+
+      <div class="panel wheel-panel">
+        <div class="sim-head">
+          <h2>🛞 轮组承载试算 <span id="wheelStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelWheel" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnWheel" class="btn btn-run" type="button">开始轮组试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          台面由<b>矩形布置的四个车轮</b>承托：填写台面内的<b>左 / 右轮位 X 坐标</b>与
+          <b>前 / 后轮位 Y 坐标</b>（mm）及<b>四轮额定载荷</b>（kg）。后端以<b>底层非悬空立柱</b>
+          的落点与实载为点载荷，按双向杠杆（双线性）比例把载荷分到四轮：<b>落点越出轮组矩形时
+          允许外推，负反力不截零</b>（否则力与力矩不平衡）。页面给出逐轮反力、利用率、超载与
+          负反力风险，并核对<b>反力之和与绕 X/Y 轴力矩</b>是否与点载荷一致。试算
+          <span class="hl">只读不写盘</span>；<b>编辑架体后旧结果立即失效</b>。
+        </p>
+        <div class="wheel-form">
+          <div class="wheel-coords">
+            <label>左轮位 X xLeft (mm)
+              <input type="number" step="any" id="wheelXLeft" value="150" />
+            </label>
+            <label>右轮位 X xRight (mm)
+              <input type="number" step="any" id="wheelXRight" value="1150" />
+            </label>
+            <label>前轮位 Y yFront (mm)
+              <input type="number" step="any" id="wheelYFront" value="150" />
+            </label>
+            <label>后轮位 Y yRear (mm)
+              <input type="number" step="any" id="wheelYRear" value="750" />
+            </label>
+          </div>
+          <div class="wheel-ratings">
+            <label>左前 FL 额定 (kg)
+              <input type="number" step="any" id="wheelRatedFL" value="500" min="0" />
+            </label>
+            <label>右前 FR 额定 (kg)
+              <input type="number" step="any" id="wheelRatedFR" value="500" min="0" />
+            </label>
+            <label>左后 RL 额定 (kg)
+              <input type="number" step="any" id="wheelRatedRL" value="500" min="0" />
+            </label>
+            <label>右后 RR 额定 (kg)
+              <input type="number" step="any" id="wheelRatedRR" value="500" min="0" />
+            </label>
+          </div>
+        </div>
+        <div id="wheelOutput"></div>
       </div>
 
       <div class="bottom-grid">

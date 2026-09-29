@@ -2271,3 +2271,362 @@ def door_passage(
         "positions": positions,
         "note": note,
     }
+
+
+# --------------------------------------------------------------------------
+# 轮组承载试算（Wheel Group Load Trial）
+#
+# 台面由矩形布置的四个车轮承托（刚性台面、四点刚体反力模型）：
+#   * 轮位由台面内的两条 X 坐标线（左轮 xL、右轮 xR，xL < xR）与两条 Y
+#     坐标线（前轮 yF、后轮 yR，yF < yR）张成轮组矩形；
+#   * 四轮位置：左前 FL=(xL,yF)、右前 FR=(xR,yF)、左后 RL=(xL,yR)、
+#     右后 RR=(xR,yR)，各自有独立额定载荷；
+#   * 台面受到的点载荷取*底层非悬空立柱*的落点与实载（悬空柱不承载，
+#     容量为 0 只表示立柱不限容量，不影响其是否参与）。
+#
+# 单个点载荷 P 落在 (x, y) 时，按双向杠杆（双线性）比例分到四轮：
+#   X 向：wL=(xR-x)/(xR-xL) 给左轮列、wR=(x-xL)/(xR-xL) 给右轮列；
+#   Y 向：wF=(yR-y)/(yR-yF) 给前轮行、wB=(y-yF)/(yR-yF) 给后轮行。
+#   即 R_FL=P·wL·wF、R_FR=P·wR·wF、R_RL=P·wL·wB、R_RR=P·wR·wB，
+# 该组系数对平面任意位置恒和为 1，故点载荷越出轮组矩形时只是某个系数
+# 变负（杠杆外推），**绝不能把负反力截为零**——否则竖向力平衡与绕 X/Y
+# 轴力矩平衡都会被破坏。
+#
+# 输出核对（反力合计 == 点载荷合计；绕前轮轴 X 力矩、绕左轮轴 Y 力矩
+# 分别与点载荷一次矩一致），并逐轮给出利用率、超载与负反力风险。
+# 轮距不正（坐标相等/顺序颠倒）、轮位越出台面矩形、额定载荷非正，
+# 或没有底层 / 底层没有正载荷时，明确报参数错误或无法试算。
+# 整个过程只读、不修改输入、不写盘。
+# --------------------------------------------------------------------------
+WHEEL_TRIAL_EPS = 1e-9  # 正载荷判定容差（kg）
+
+
+def _parse_wheel_coord(value: Any, name: str) -> float:
+    """解析轮位坐标（mm）；非有限数值抛 ValueError（API → 400）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}必须是数值（mm）")
+    if not math.isfinite(v):
+        raise ValueError(f"{name}必须是有限数值（mm）")
+    return v
+
+
+def _parse_wheel_params(raw: Dict[str, Any]) -> Tuple[float, float, float, float,
+                                                      Dict[str, float]]:
+    """解析轮组输入：xLeft/xRight/yFront/yRear 与四轮额定载荷。
+
+    额定载荷支持两种形式（二选一，xLeft 等扁平字段优先）：
+      扁平：ratedFL / ratedFR / ratedRL / ratedRR（缺省键按 None→400）；
+      分组：wheels={"FL":{rating},"FR":...,"RL":...,"RR":...}。
+    坐标既可用 xLeft/xRight/yFront/yRear，也可放在 wheels 各项的 x/y。
+    """
+    wheels_in = raw.get("wheels")
+    wheel_map: Dict[str, Dict[str, Any]] = {}
+    if isinstance(wheels_in, dict):
+        for key in ("FL", "FR", "RL", "RR"):
+            w = wheels_in.get(key)
+            if isinstance(w, dict):
+                wheel_map[key] = w
+    elif wheels_in is not None:
+        raise ValueError("轮组参数 wheels 必须是对象（含 FL/FR/RL/RR 四轮）")
+
+    def coord(field: str, wx_key: str, name: str) -> float:
+        if raw.get(field) is not None:
+            return _parse_wheel_coord(raw.get(field), name)
+        if wx_key and wheel_map and wx_key in wheel_map:
+            return _parse_wheel_coord(wheel_map[wx_key].get("x" if field[0] == "x" else "y"), name)
+        raise ValueError(f"缺少{name}参数")
+
+    x_left = coord("xLeft", "FL", "左轮位 X 坐标 xLeft")
+    x_right = coord("xRight", "FR", "右轮位 X 坐标 xRight")
+    y_front = coord("yFront", "FL", "前轮位 Y 坐标 yFront")
+    y_rear = coord("yRear", "RL", "后轮位 Y 坐标 yRear")
+
+    def rating(key: str, label: str) -> float:
+        if raw.get(key) is not None:
+            v = raw.get(key)
+        elif key[5:] in wheel_map:
+            v = wheel_map[key[5:]].get("rating")
+        else:
+            raise ValueError(f"缺少{label}额定载荷参数 {key}")
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label}额定载荷必须是数值（kg）")
+        if not math.isfinite(fv):
+            raise ValueError(f"{label}额定载荷必须是有限数值（kg）")
+        if fv <= 0:
+            raise ValueError(f"{label}额定载荷必须大于 0（收到 {r2(fv)} kg）")
+        return fv
+
+    ratings = {
+        "FL": rating("ratedFL", "左前轮"),
+        "FR": rating("ratedFR", "右前轮"),
+        "RL": rating("ratedRL", "左后轮"),
+        "RR": rating("ratedRR", "右后轮"),
+    }
+    return x_left, x_right, y_front, y_rear, ratings
+
+
+def wheel_load_trial(raw_state: Optional[Dict[str, Any]],
+                     params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """轮组承载试算：底层非悬空立柱点载荷按矩形四轮双向杠杆比例分配反力。
+
+    参数
+    ----
+    raw_state : 当前架体输入（不被修改、不被持久化）
+    params    : 轮组参数，支持
+                {"xLeft","xRight","yFront","yRear",
+                 "ratedFL","ratedFR","ratedRL","ratedRR"}
+                或 {"wheels": {"FL": {"x","y","rating"}, ...}}；
+                轮距不正 / 轮位越出台面 / 额定载荷非正抛 ValueError（API → 400）。
+
+    返回
+    ----
+    evaluable=True 时给出四轮位置与逐轮反力、利用率、超载/负反力标记，
+    底层非悬空立柱点载荷明细（含外推/重叠标记），以及力平衡与绕 X/Y 轴
+    力矩平衡核对（反力侧 − 点载荷侧残差）。evaluable=False 时 reason
+    说明无法试算的原因（没有底层 / 底层没有正载荷）。
+    """
+    params = params if isinstance(params, dict) else {}
+    x_left, x_right, y_front, y_rear, ratings = _parse_wheel_params(params)
+    norm = normalize(raw_state)
+    car = norm["car"]
+
+    base = {
+        "xLeft": r2(x_left), "xRight": r2(x_right),
+        "yFront": r2(y_front), "yRear": r2(y_rear),
+        "trackX": r2(x_right - x_left),
+        "wheelbaseY": r2(y_rear - y_front),
+        "ratings": {k: r2(v) for k, v in ratings.items()},
+        "car": {"name": car["name"], "w": r2(car["w"]), "d": r2(car["d"])},
+    }
+
+    def fail(reason: str) -> Dict[str, Any]:
+        return {
+            "evaluable": False,
+            "reason": reason,
+            **base,
+            "totalLoad": 0.0,
+            "pointLoads": [],
+            "pointLoadCount": 0,
+            "overhangCount": 0,
+            "wheels": None,
+            "checks": None,
+            "risks": [],
+        }
+
+    # ---- 轮距与台面范围校验 ----
+    if x_right <= x_left:
+        raise ValueError(
+            f"左右轮位 X 坐标必须严格满足 xLeft < xRight：收到 xLeft={r2(x_left)}、"
+            f"xRight={r2(x_right)}（轮距 {r2(x_right - x_left)} mm），轮距不正"
+        )
+    if y_rear <= y_front:
+        raise ValueError(
+            f"前后轮位 Y 坐标必须严格满足 yFront < yRear：收到 yFront={r2(y_front)}、"
+            f"yRear={r2(y_rear)}（轴距 {r2(y_rear - y_front)} mm），轮距不正"
+        )
+    car_rect = {"x": 0.0, "y": 0.0, "w": car["w"], "d": car["d"]}
+    for name, x, y in (
+        ("左前轮 FL", x_left, y_front),
+        ("右前轮 FR", x_right, y_front),
+        ("左后轮 RL", x_left, y_rear),
+        ("右后轮 RR", x_right, y_rear),
+    ):
+        if not in_rect(x, y, car_rect):
+            raise ValueError(
+                f"{name}轮位（{r2(x)}, {r2(y)}）越出{car['name']}台面矩形"
+                f"（0~{r2(car['w'])} × 0~{r2(car['d'])} mm）"
+            )
+
+    layers = norm["layers"]
+    if not layers:
+        return fail("当前架体没有任何层，不存在底层立柱点载荷，无法进行轮组承载试算")
+    bottom = layers[0]
+    bottom_name = bottom["name"]
+
+    # ---- 底层非悬空立柱落点与实载（经整架计算得到，保证与页面结果一致）----
+    bottom_result = _calculate(norm)["layers"][0]
+    posts_out = bottom_result["posts"]
+    point_loads: List[Dict[str, Any]] = []
+    groups: Dict[Tuple[float, float], List[Dict[str, Any]]] = {}
+    for po in posts_out:
+        if po["hanging"]:
+            continue
+        x, y, load = float(po["x"]), float(po["y"]), float(po["load"])
+        groups.setdefault((x, y), []).append(po)
+        point_loads.append(
+            {
+                "post": po["id"],
+                "x": r2(x),
+                "y": r2(y),
+                "load": r2(load),
+                "overlap": bool(po["overlap"]),
+                "overlapWith": list(po.get("overlapWith") or []),
+                "capacity": po["capacity"],
+                "outsideWheelRect": not (
+                    x_left <= x <= x_right and y_front <= y <= y_rear
+                ),
+            }
+        )
+
+    total_load = sum(p["load"] for p in point_loads)
+    overhang_n = sum(1 for p in point_loads if p["outsideWheelRect"])
+    base.update(
+        totalLoad=r2(total_load),
+        pointLoads=point_loads,
+        pointLoadCount=len(point_loads),
+        overhangCount=overhang_n,
+    )
+    if total_load <= WHEEL_TRIAL_EPS:
+        return fail(
+            f"{bottom_name}非悬空立柱的实载合计为 0（无正载荷），台面没有需要四个车轮"
+            "承担的载荷，无法进行轮组承载试算；请先在架体录入棚板自重或坯件重量"
+        )
+
+    # ---- 双向杠杆（双线性）反力分配：允许外推，不截断负反力 ----
+    dx = x_right - x_left
+    dy = y_rear - y_front
+    react = {"FL": 0.0, "FR": 0.0, "RL": 0.0, "RR": 0.0}
+    # 完全相同坐标的落点合并为一个点载荷参与分配；TOL_MM 内但不重合的点
+    # 各自仍是独立点载荷（与点载荷明细一一对应）。
+    merged: List[Tuple[float, float, float]] = []
+    for (x, y), members in groups.items():
+        merged.append((x, y, sum(float(m["load"]) for m in members)))
+    # 点载荷侧一次矩（取前轮轴 y=yFront、左轮轴 x=xLeft 为矩轴）
+    moment_x_loads = sum(P * (y - y_front) for x, y, P in merged)  # 绕 X（前轮轴）
+    moment_y_loads = sum(P * (x - x_left) for x, y, P in merged)  # 绕 Y（左轮轴）
+    for x, y, P in merged:
+        wl = (x_right - x) / dx
+        wr = (x - x_left) / dx
+        wf = (y_rear - y) / dy
+        wb = (y - y_front) / dy
+        react["FL"] += P * wl * wf
+        react["FR"] += P * wr * wf
+        react["RL"] += P * wl * wb
+        react["RR"] += P * wr * wb
+
+    wheel_pos = {
+        "FL": (x_left, y_front),
+        "FR": (x_right, y_front),
+        "RL": (x_left, y_rear),
+        "RR": (x_right, y_rear),
+    }
+    wheel_labels = {
+        "FL": "左前轮", "FR": "右前轮", "RL": "左后轮", "RR": "右后轮",
+    }
+    wheels: List[Dict[str, Any]] = []
+    risks: List[Dict[str, Any]] = []
+    for key in ("FL", "FR", "RL", "RR"):
+        wx, wy = wheel_pos[key]
+        r = react[key]
+        rating = ratings[key]
+        overloaded = r > rating + 1e-9
+        negative = r < -WHEEL_TRIAL_EPS
+        util = r / rating if rating > 0 else None
+        wheels.append(
+            {
+                "key": key,
+                "name": wheel_labels[key],
+                "x": r2(wx),
+                "y": r2(wy),
+                "reaction": r2(r),
+                "rating": r2(rating),
+                "utilization": round(util, 4) if util is not None else None,
+                "overloaded": overloaded,
+                "negative": negative,
+            }
+        )
+        if overloaded:
+            risks.append(
+                {
+                    "level": "error",
+                    "type": "wheel-overload",
+                    "wheel": key,
+                    "message": (
+                        f"{wheel_labels[key]} {key}（{r2(wx)}, {r2(wy)}）超额受力："
+                        f"反力 {r2(r)} kg > 额定载荷 {r2(rating)} kg，"
+                        f"利用率 {round(util * 100, 1)}%"
+                    ),
+                }
+            )
+        if negative:
+            risks.append(
+                {
+                    "level": "error",
+                    "type": "negative-reaction",
+                    "wheel": key,
+                    "message": (
+                        f"{wheel_labels[key]} {key}（{r2(wx)}, {r2(wy)}）出现负反力 "
+                        f"{r2(r)} kg：点载荷合力相对四轮矩形外偏，该轮需要向下"
+                        "拉住台面才能平衡（刚体杠杆外推结果，未截断为零），实际"
+                        "车轮只能承压，存在台面上翘/脱轮风险"
+                    ),
+                }
+            )
+
+    if overhang_n:
+        risks.append(
+            {
+                "level": "warn",
+                "type": "extrapolation",
+                "wheel": None,
+                "message": (
+                    f"{bottom_name}有 {overhang_n} 个非悬空立柱落点越出四轮矩形"
+                    "（已按杠杆比例外推分配，负反力不截零）；相关车轮可能出现负反力，"
+                    "请结合上方逐轮结果核对"
+                ),
+            }
+        )
+
+    # ---- 平衡核对：反力侧 − 点载荷侧（大数量级用相对容差，避免二进制尾差误报）----
+    reaction_sum = sum(react.values())
+    moment_x_react = (
+        (react["RL"] + react["RR"]) * dy      # 绕 X（前轮轴 y=yFront）
+    )
+    moment_y_react = (
+        (react["FR"] + react["RR"]) * dx      # 绕 Y（左轮轴 x=xLeft）
+    )
+
+    def _balanced(a: float, b: float) -> bool:
+        return abs(a - b) <= 1e-7 * max(1.0, abs(a), abs(b))
+
+    checks = {
+        "force": {
+            "reactionSum": r2(reaction_sum),
+            "loadSum": r2(total_load),
+            "residual": r2(reaction_sum - total_load),
+            "ok": _balanced(reaction_sum, total_load),
+        },
+        "momentX": {
+            # 绕 X 轴（沿左右方向、过前轮 y=yFront）：力臂为 y−yFront
+            "axis": "过前轮 y=yFront 的 X 向轴",
+            "reactionMoment": r2(moment_x_react),
+            "loadMoment": r2(moment_x_loads),
+            "residual": r2(moment_x_react - moment_x_loads),
+            "ok": _balanced(moment_x_react, moment_x_loads),
+        },
+        "momentY": {
+            # 绕 Y 轴（沿前后方向、过左轮 x=xLeft）：力臂为 x−xLeft
+            "axis": "过左轮 x=xLeft 的 Y 向轴",
+            "reactionMoment": r2(moment_y_react),
+            "loadMoment": r2(moment_y_loads),
+            "residual": r2(moment_y_react - moment_y_loads),
+            "ok": _balanced(moment_y_react, moment_y_loads),
+        },
+        "allOk": False,
+    }
+    checks["allOk"] = (
+        checks["force"]["ok"] and checks["momentX"]["ok"] and checks["momentY"]["ok"]
+    )
+
+    return {
+        "evaluable": True,
+        "reason": None,
+        **base,
+        "wheels": wheels,
+        "checks": checks,
+        "risks": risks,
+    }

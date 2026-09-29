@@ -36,6 +36,13 @@ POST /api/door-passage
                      全程可达时回溯一条位置序列与逐门左/右/顶部净空；
                      只计算，不写盘；架体没有层时返回 evaluable=false，门参数非法返回 400
 POST /api/reset      恢复内置示例数据
+POST /api/wheel-load 轮组承载试算：body {"state"(可省), "xLeft","xRight","yFront",
+                     "yRear"(台面内四轮坐标 mm), "ratedFL/FR/RL/RR"(四轮额定载荷 kg)}
+                     ——以底层非悬空立柱的落点与实载为点载荷，按矩形四轮的双向杠杆
+                     （双线性）比例分配反力；落点越出轮组矩形时允许外推、负反力不
+                     截零。逐轮返回反力、利用率、超载与负反力风险，并核对四轮反力
+                     之和及绕 X/Y 轴力矩与输入点载荷一致；只计算，不写盘；轮距不正、
+                     轮位越出台面、额定载荷非正返回 400，底层无正载荷时 evaluable=false
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ from .calc import (
     overturn_check,
     simulate,
     suggest_posts,
+    wheel_load_trial,
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -158,6 +166,28 @@ def api_reset():
     sample = _read_json(SAMPLE_FILE)
     _atomic_write_json(STATE_FILE, sample)
     return jsonify({"ok": True, "state": sample, "result": calculate(sample)})
+
+
+@app.route("/api/wheel-load", methods=["POST"])
+def api_wheel_load():
+    """轮组承载试算：底层非悬空立柱点载荷按矩形四轮双向杠杆分配反力。
+
+    只读取当前编辑架体与随请求提交的轮位/额定载荷，不写盘、不改已保存状态。
+    轮距不正（坐标相等/顺序颠倒）、轮位越出台面、额定载荷非正 → 400；
+    底层没有正载荷属于正常结果 → 200 + evaluable=false。
+    """
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    # 轮组参数既可用扁平字段，也可放在 wheels 对象里，整体透传给计算引擎
+    params = {k: v for k, v in payload.items() if k != "state"}
+    try:
+        result = wheel_load_trial(state, params)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
 
 
 @app.route("/api/suggest", methods=["POST"])
